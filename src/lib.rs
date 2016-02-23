@@ -68,7 +68,7 @@ macro_rules! impl_drop {
 
 macro_rules! c_enum {
   ($enum_name:ident { $($name:ident = $num:expr),* }) => {
-    #[derive(PartialEq,Eq,PartialOrd,Ord,Debug)]
+    #[derive(PartialEq,Eq,PartialOrd,Ord,Debug,Copy,Clone)]
     pub enum $enum_name {
       UnrecognizedEnumValue(raw::c_uint),
       $($name),*
@@ -149,6 +149,27 @@ c_enum!(DataType {
   QUInt16 = 16,
 });
 
+fn data_type_size(t: DataType) -> usize {
+  match t {
+    DataType::Float => mem::size_of::<f32>(),
+    DataType::Double => mem::size_of::<f64>(),
+    DataType::Int32 => mem::size_of::<i32>(),
+    DataType::UInt8 => mem::size_of::<u8>(),
+    DataType::Int16 => mem::size_of::<i16>(),
+    DataType::Int8 => mem::size_of::<i8>(),
+    DataType::String => mem::size_of::<*const libc::c_char>(),
+    DataType::Complex => mem::size_of::<f32>() * 2,
+    DataType::Int64 => mem::size_of::<i64>(),
+    DataType::Bool => mem::size_of::<u8>(),
+    DataType::QInt8 => mem::size_of::<i8>(),
+    DataType::QUInt8 => mem::size_of::<u8>(),
+    DataType::BFloat16 => mem::size_of::<u16>(),
+    DataType::QInt16 => mem::size_of::<i16>(),
+    DataType::QUInt16 => mem::size_of::<u16>(),
+    x => panic!("Unrecognized data type: {}", x),
+  }
+}
+
 ////////////////////////
 
 pub struct Status {
@@ -211,6 +232,10 @@ impl Debug for Status {
       Ok(())
     }
   }
+}
+
+fn invalid_arg(msg: &str) -> Status {
+  Status::new_set(Code::InvalidArgument, msg).unwrap()
 }
 
 ////////////////////////
@@ -278,6 +303,59 @@ impl Session {
     }
     status
   }
+
+  // Would like to take inputs as &mut [Box<AnyTensor>], but mutable slices don't have a clear() method.
+  pub fn run(&mut self,
+             input_names: &[&str],
+             inputs: &mut Vec<Box<AnyTensor>>,
+             output_tensor_names: &[&str],
+             target_node_names: &[&str]) -> Result<Vec<Box<AnyTensor>>> {
+    if input_names.len() != inputs.len() {
+      return Err(invalid_arg(&format!("input_names.len() ({}) not equal to inputs.len() ({})", input_names.len(), inputs.len())));
+    }
+    // We have to keep the CStrings around in order to keep the *const c_chars valid.
+    let input_name_cstrings = try!(cstring_array(input_names, "input_names"));
+    let output_tensor_names_cstrings = try!(cstring_array(output_tensor_names, "output_tensor_names"));
+    let target_node_names_cstrings = try!(cstring_array(target_node_names, "target_node_names"));
+    let mut input_name_ptrs: Vec<*const ::libc::c_char> = input_name_cstrings.iter().map(|x| x.as_ptr()).collect();
+    let mut output_tensor_name_ptrs: Vec<*const ::libc::c_char> = output_tensor_names_cstrings.iter().map(|x| x.as_ptr()).collect();
+    let mut target_node_name_ptrs: Vec<*const ::libc::c_char> = target_node_names_cstrings.iter().map(|x| x.as_ptr()).collect();
+    let mut tensor_ptrs: Vec<*mut tf::TF_Tensor> = inputs.iter_mut().map(|x| {
+      let inner = x.inner();
+      unsafe {
+        x.detach();
+      }
+      inner
+    }).collect();
+    inputs.clear();
+    let mut output_ptrs = Vec::with_capacity(output_tensor_names.len());
+    let status = Status::new();
+    unsafe {
+      // TF_Run consumes the input tensors
+      tf::TF_Run(self.inner,
+                 input_name_ptrs.as_mut_ptr(),
+                 tensor_ptrs.as_mut_ptr(),
+                 tensor_ptrs.len() as i32,
+                 output_tensor_name_ptrs.as_mut_ptr(),
+                 output_ptrs.as_mut_ptr(),
+                 output_ptrs.len() as i32,
+                 target_node_name_ptrs.as_mut_ptr(),
+                 target_node_name_ptrs.len() as i32,
+                 status.inner);
+    }
+    if status.is_ok() {
+      Ok(output_ptrs.iter().map(|x: &*mut tf::Struct_TF_Tensor| tensor_from_ptr(*x)).collect())
+    } else {
+      Err(status)
+    }
+  }
+}
+
+fn cstring_array(strings: &[&str], arg_name: &str) -> Result<Vec<CString>> {
+  match strings.iter().map(|x| CString::new(*x)).collect() {
+    Ok(x) => Ok(x),
+    Err(_) => return Err(invalid_arg(&format!("{} cannot contain embedded nulls", arg_name))),
+  }
 }
 
 impl Drop for Session {
@@ -344,6 +422,48 @@ unsafe extern "C" fn tensor_deallocator(_data: *mut raw::c_void,
                                  tensor_data: *mut raw::c_void)-> () {
   let ptr: *mut *mut Any = mem::transmute(tensor_data);
   Box::from_raw(*Box::from_raw(ptr));
+}
+
+unsafe fn mk_tensor<T: TensorType + 'static>(inner: *mut tf::TF_Tensor, len: usize, dims: Vec<u64>) -> Box<AnyTensor> {
+  let td = Box::into_raw(Box::new(TensorData {
+    inner: inner,
+    data: Buffer::from_ptr(tf::TF_TensorData(inner) as *mut T, len),
+    dims: dims,
+  }));
+  Box::new(Tensor {
+    tensor: td,
+  })
+}
+
+fn tensor_from_ptr(inner: *mut tf::TF_Tensor) -> Box<AnyTensor> {
+  unsafe {
+    let data_type = DataType::from_int(mem::transmute(tf::TF_TensorType(inner)));
+    let len = tf::TF_TensorByteSize(inner) / data_type_size(data_type);
+    let num_dims = tf::TF_NumDims(inner);
+    let mut dims = Vec::with_capacity(num_dims as usize);
+    for i in 0..num_dims {
+      dims.push(tf::TF_Dim(inner, i) as u64);
+    }
+    match data_type {
+      DataType::Float => mk_tensor::<f32>(inner, len, dims),
+      DataType::Double => mk_tensor::<f64>(inner, len, dims),
+      DataType::Int32 => mk_tensor::<i32>(inner, len, dims),
+      DataType::UInt8 => mk_tensor::<u8>(inner, len, dims),
+      DataType::Int16 => mk_tensor::<i16>(inner, len, dims),
+      DataType::Int8 => mk_tensor::<i8>(inner, len, dims),
+      // TODO: provide type for String
+      // TODO: provide type for Complex
+      DataType::Int64 => mk_tensor::<i64>(inner, len, dims),
+      DataType::Bool => mk_tensor::<bool>(inner, len, dims),
+      // TODO: provide type for QInt8
+      // TODO: provide type for QUInt8
+      // TODO: provide type for QInt32
+      // TODO: provide type for BFloat16
+      // TODO: provide type for QInt16
+      // TODO: provide type for QUInt16
+      x => panic!("Unrecognized tensor type: {}", x),
+    }
+  }
 }
 
 // TODO: Replace with Iterator::product once that's stable
@@ -439,6 +559,30 @@ struct TensorData<T> {
 
 ////////////////////////
 
+pub trait AnyTensor {
+  fn data_type(&self) -> DataType;
+  fn inner(&self) -> *mut tf::TF_Tensor;
+  unsafe fn detach(&mut self);
+}
+
+impl<T: TensorType> AnyTensor for Tensor<T> {
+  fn data_type(&self) -> DataType {
+    T::data_type()
+  }
+
+  fn inner(&self) -> *mut tf::TF_Tensor {
+    unsafe {
+      (*self.tensor).inner
+    }
+  }
+
+  unsafe fn detach(&mut self) {
+    Tensor::detach(self);
+  }
+}
+
+////////////////////////
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -496,5 +640,25 @@ mod tests {
     // An empty array is a valid proto, since all fields are optional.
     let status = session.extend_graph(&vec![]);
     assert!(status.is_ok());
+  }
+
+  #[test]
+  fn test_run() {
+    let graph_proto = vec![
+      0x0a, 0x2a, 0x0a, 0x01, 0x78, 0x12, 0x0b, 0x50, 0x6c, 0x61, 0x63, 0x65, 0x68, 0x6f, 0x6c, 0x64,
+      0x65, 0x72, 0x2a, 0x0b, 0x0a, 0x05, 0x64, 0x74, 0x79, 0x70, 0x65, 0x12, 0x02, 0x30, 0x01, 0x2a,
+      0x0b, 0x0a, 0x05, 0x73, 0x68, 0x61, 0x70, 0x65, 0x12, 0x02, 0x3a, 0x00, 0x0a, 0x30, 0x0a, 0x03,
+      0x79, 0x2f, 0x79, 0x12, 0x05, 0x43, 0x6f, 0x6e, 0x73, 0x74, 0x2a, 0x0b, 0x0a, 0x05, 0x64, 0x74,
+      0x79, 0x70, 0x65, 0x12, 0x02, 0x30, 0x01, 0x2a, 0x15, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65,
+      0x12, 0x0c, 0x42, 0x0a, 0x08, 0x01, 0x12, 0x00, 0x2a, 0x04, 0x00, 0x00, 0x00, 0x40, 0x0a, 0x19,
+      0x0a, 0x01, 0x79, 0x12, 0x03, 0x4d, 0x75, 0x6c, 0x1a, 0x01, 0x78, 0x1a, 0x03, 0x79, 0x2f, 0x79,
+      0x2a, 0x07, 0x0a, 0x01, 0x54, 0x12, 0x02, 0x30, 0x01
+    ];
+    let mut session = create_session();
+    let status = session.extend_graph(&graph_proto);
+    assert!(status.is_ok());
+    let x = Box::new(<Tensor<f32>>::new(&[2, 3])) as Box<AnyTensor>;
+    let result = session.run(&vec!["x"], &mut vec![x], &vec!["y"], &vec![]).unwrap();
+    assert_eq!(result.len(), 1);
   }
 }
