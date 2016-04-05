@@ -3,6 +3,8 @@
 extern crate libc;
 extern crate libtensorflow_sys;
 
+use std::any::Any;
+use std::cell::RefCell;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::NulError;
@@ -18,6 +20,12 @@ use libtensorflow_sys as tf;
 
 mod buffer;
 pub use buffer::Buffer;
+
+////////////////////////
+
+thread_local!(static BUFFER_NEW_COUNT: RefCell<usize> = RefCell::new(0));
+
+thread_local!(static BUFFER_DROP_COUNT: RefCell<usize> = RefCell::new(0));
 
 ////////////////////////
 
@@ -288,7 +296,7 @@ pub type Result<T> = std::result::Result<T, Status>;
 
 ////////////////////////
 
-pub trait TensorType: Default + Clone {
+pub trait TensorType: Default + Clone + Any {
   // TODO: Use associated constants when/if available
   fn data_type() -> DataType;
 }
@@ -323,14 +331,19 @@ tensor_type!(bool, Bool);
 ////////////////////////
 
 pub struct Tensor<T> {
-  inner: *mut tf::TF_Tensor,
-  data: Buffer<T>,
-  dims: Vec<u64>,
+  tensor: *mut TensorData<T>,
 }
 
-unsafe extern "C" fn noop_deallocator(_data: *mut raw::c_void,
-                               _len: ::libc::size_t,
-                               _arg: *mut raw::c_void)-> () {
+// Note that the tensor_data arg is a double pointer. We can't pass in *mut TensorData<T>, because
+// in this function, we don't know what T is. We can't pass in *mut Any (or any pointer to a trait),
+// because trait pointers are twice the width of native pointers. We box the *mut Any, because now
+// we can cast back and forth between *mut c_void and *mut *mut Any, since *mut Any is a concrete
+// type with no parameters.
+unsafe extern "C" fn tensor_deallocator(_data: *mut raw::c_void,
+                                 _len: libc::size_t,
+                                 tensor_data: *mut raw::c_void)-> () {
+  let ptr: *mut *mut Any = mem::transmute(tensor_data);
+  Box::from_raw(*Box::from_raw(ptr));
 }
 
 // TODO: Replace with Iterator::product once that's stable
@@ -342,7 +355,7 @@ fn product(values: &[u64]) -> u64 {
   product
 }
 
-impl<T: TensorType> Tensor<T> {
+impl<T: TensorType + 'static> Tensor<T> {
   pub fn new(dims: &[u64]) -> Self {
     let total = product(dims);
     let data = <Buffer<T>>::new(total as usize);
@@ -357,44 +370,71 @@ impl<T: TensorType> Tensor<T> {
     if total != data.len() as u64 {
       return None
     }
-    let inner = unsafe {
-      tf::TF_NewTensor(mem::transmute(T::data_type().to_int()),
-                       dims.as_ptr() as *mut i64,
-                       dims.len() as i32,
-                       data.as_ptr() as *mut raw::c_void,
-                       data.len(),
-                       Some(noop_deallocator),
-                       std::ptr::null_mut())
-    };
     let mut dims_vec = Vec::new();
     // TODO: Use extend_from_slice once we're on Rust 1.6
     dims_vec.extend(dims.iter());
-    Some(Tensor {
-      inner: inner,
+    let data_ptr = data.as_ptr() as *mut raw::c_void;
+    let data_len = data.len();
+    let tensor_data = Box::into_raw(Box::new(TensorData {
+      inner: std::ptr::null_mut(),
       data: data,
       dims: dims_vec,
-    })
+    }));
+    let tensor = Tensor {
+      tensor: tensor_data,
+    };
+    unsafe {
+      // See notes on tensor_deallocator
+      let destructor = Box::new(tensor_data as *mut Any);
+      (*tensor.tensor).inner =
+        tf::TF_NewTensor(mem::transmute(T::data_type().to_int()),
+                         dims.as_ptr() as *mut i64,
+                         dims.len() as i32,
+                         data_ptr,
+                         data_len,
+                         Some(tensor_deallocator),
+                         Box::into_raw(destructor) as *mut raw::c_void);
+    }
+    Some(tensor)
   }
 
   pub fn data(&self) -> &Buffer<T> {
-    &self.data
+    unsafe {
+      &(*self.tensor).data
+    }
   }
 
   pub fn data_mut(&mut self) -> &mut Buffer<T> {
-    &mut self.data
+    unsafe {
+      &mut (*self.tensor).data
+    }
   }
 
   pub fn dims(&self) -> &[u64] {
-    &self.dims
+    unsafe {
+      &(*self.tensor).dims
+    }
+  }
+
+  unsafe fn detach(&mut self) {
+    self.tensor = std::ptr::null_mut();
   }
 }
 
 impl<T> Drop for Tensor<T> {
   fn drop(&mut self) {
-    unsafe {
-      tf::TF_DeleteTensor(self.inner);
+    if !self.tensor.is_null() {
+      unsafe {
+        tf::TF_DeleteTensor((*self.tensor).inner);
+      }
     }
   }
+}
+
+struct TensorData<T> {
+  inner: *mut tf::TF_Tensor,
+  data: Buffer<T>,
+  dims: Vec<u64>,
 }
 
 ////////////////////////
@@ -402,6 +442,8 @@ impl<T> Drop for Tensor<T> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use super::BUFFER_DROP_COUNT;
+  use super::BUFFER_NEW_COUNT;
 
   fn create_session() -> Session {
     let options = SessionOptions::new();
@@ -424,9 +466,15 @@ mod tests {
 
   #[test]
   fn test_tensor() {
-    let mut tensor = <Tensor<f32>>::new(&[2, 3]);
-    assert_eq!(tensor.data().len(), 6);
-    tensor.data_mut()[0] = 1.0;
+    let initial_new = BUFFER_NEW_COUNT.with(|x| *x.borrow());
+    let initial_drop = BUFFER_DROP_COUNT.with(|x| *x.borrow());
+    {
+      let mut tensor = <Tensor<f32>>::new(&[2, 3]);
+      assert_eq!(tensor.data().len(), 6);
+      tensor.data_mut()[0] = 1.0;
+    }
+    assert_eq!(BUFFER_NEW_COUNT.with(|x| *x.borrow()) - initial_new, 1);
+    assert_eq!(BUFFER_DROP_COUNT.with(|x| *x.borrow()) - initial_drop, 1);
   }
 
   #[test]

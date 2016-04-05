@@ -13,6 +13,8 @@ use std::ops::RangeFrom;
 use std::ops::RangeFull;
 use std::ops::RangeTo;
 use std::slice;
+use super::BUFFER_NEW_COUNT;
+use super::BUFFER_DROP_COUNT;
 
 /// Fixed-length heap-allocated vector.
 /// This is basically a Box<[T]>, except that that type can't actually be constructed.
@@ -39,6 +41,7 @@ impl<T: Default> Buffer<T> {
 
 impl<T> Buffer<T> {
   pub unsafe fn new_uninitialized(len: usize) -> Self {
+    BUFFER_NEW_COUNT.with(|x| {*x.borrow_mut() += 1;});
     let elem_size = mem::size_of::<T>();
     let alloc_size = len * elem_size;
     let align = mem::align_of::<T>();
@@ -65,6 +68,7 @@ impl<T> Buffer<T> {
 
 impl<T> Drop for Buffer<T> {
   fn drop(&mut self) {
+    BUFFER_DROP_COUNT.with(|x| {*x.borrow_mut() += 1;});
     if self.owned {
       // It would be nice to skip the loop entirely if std::intrinsics::needs_drop() returns false,
       // but it's not stable, and the docs say it probably never will be.
